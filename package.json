@@ -1,0 +1,39 @@
+{
+  "name": "pi-getpass",
+  "version": "0.1.0",
+  "description": "Pi package providing a secure getpass tool for temporary secret environment variables",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "getpass"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/getpass.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Microwave-WYB/pi-getpass.git"
+  },
+  "homepage": "https://github.com/Microwave-WYB/pi-getpass",
+  "bugs": {
+    "url": "https://github.com/Microwave-WYB/pi-getpass/issues"
+  },
+  "files": [
+    "README.md",
+    "extensions"
+  ]
+}
