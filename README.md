@@ -2,6 +2,8 @@
 
 A pi package that adds a `getpass` tool for collecting secrets safely from the user.
 
+![pi-getpass masked secret input](./screenshot.png)
+
 When the agent needs an API key, token, password, or other secret, it calls `getpass` with an exact env var name like `OPENAI_API_KEY`. The package temporarily replaces the normal pi input UI with a masked secret input, stores the secret in `process.env` for the current pi process, and returns only the env var name to the model. The secret value is not written to chat/session history.
 
 ## What this is / is not
