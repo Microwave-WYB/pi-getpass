@@ -44,7 +44,6 @@ Parameters:
 - `envVar` — exact env var name to populate, e.g. `OPENAI_API_KEY`, `GITHUB_TOKEN`, `DATABASE_URL`
 - `overwrite` — allow replacing an existing env var of the same name; default `false`
 - `prompt` — text shown to the user
-- `confirm` — ask twice and reject mismatches
 - `allowEmpty` — allow an empty secret
 
 Example agent flow:

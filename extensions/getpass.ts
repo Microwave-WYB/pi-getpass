@@ -20,11 +20,6 @@ const getpassSchema = Type.Object({
 			description: "Human-readable prompt to show to the user. Do not include the secret value.",
 		}),
 	),
-	confirm: Type.Optional(
-		Type.Boolean({
-			description: "Ask the user to type the secret twice and reject mismatches. Defaults to false.",
-		}),
-	),
 	allowEmpty: Type.Optional(
 		Type.Boolean({
 			description: "Allow an empty secret. Defaults to false.",
@@ -160,12 +155,6 @@ async function collectSecret(ctx: ExtensionContext, params: GetpassParams): Prom
 	const secret = await promptSecret(ctx, prompt, envVar);
 	if (secret === null) throw new Error("getpass cancelled by user");
 	if (!params.allowEmpty && secret.length === 0) throw new Error("getpass received an empty secret");
-
-	if (params.confirm) {
-		const again = await promptSecret(ctx, "Confirm secret", envVar);
-		if (again === null) throw new Error("getpass cancelled by user");
-		if (secret !== again) throw new Error("getpass confirmation did not match");
-	}
 
 	return { envVar, secret };
 }
