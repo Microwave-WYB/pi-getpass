@@ -19,18 +19,18 @@ Use normal secret hygiene: do not echo secrets, avoid tracing, unset secrets whe
 
 ## Install
 
-From this local checkout:
-
-```bash
-pi install /home/wyb/Projects/pi-getpass
-# or for one run only:
-pi -e /home/wyb/Projects/pi-getpass
-```
-
-After publishing/cloning:
-
 ```bash
 pi install git:github.com/Microwave-WYB/pi-getpass
+```
+
+For local development from a clone:
+
+```bash
+git clone https://github.com/Microwave-WYB/pi-getpass.git
+cd pi-getpass
+pi install .
+# or for one run only:
+pi -e .
 ```
 
 ## Tools
