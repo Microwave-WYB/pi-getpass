@@ -1,10 +1,10 @@
 {
   "name": "pi-getpass",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi package providing a secure getpass tool for temporary secret environment variables",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
   },
   "keywords": [
     "pi-package",
@@ -36,6 +36,7 @@
   "files": [
     "README.md",
     "extensions",
+    "tests",
     "screenshot.png"
   ]
 }

@@ -10,14 +10,17 @@ When the agent needs an API key, token, password, or other secret, it calls `get
 
 `pi-getpass` is a convenience tool for getting a secret from you without asking you to paste it into chat or manually write it into an `.env` file first.
 
-It is **not** a secret-leakage guard or sandbox:
+It is **not** a sandbox:
 
-- It offers no passive protection after the secret is captured.
-- It does not stop the agent, shell commands, other extensions, or child processes from reading or printing the env var.
-- It does not redact outputs from tools like `env`, `printenv`, `set -x`, logs, or config files.
-- It only provides a cleaner input path: masked TUI input → temporary env var → agent can use the env var name.
+- It does not stop the agent, shell commands, other extensions, or child processes from reading the env var.
+- It cannot prevent a process from writing a secret directly to external logs, files, or services.
+- Redaction applies to tool output and `!`/`!!` shell output visible through pi, including streaming and finalized results.
+- Tool-call arguments are not rewritten, since changing them could break commands that intentionally consume the secret through shell expansion.
+- It only tracks values collected by `getpass` in the current extension runtime; pre-existing environment variables are not redacted.
+- Reloading or restarting pi clears the tracked-value set. Recollect a disposable value before each redaction test.
+- Redaction matches contiguous, exact plaintext values; encoded or transformed variants are not detected.
 
-Use normal secret hygiene: do not echo secrets, avoid tracing, unset secrets when done, and review commands that consume them.
+Use normal secret hygiene: avoid tracing, unset secrets when done, and review commands that consume them. Tracked secret values appearing in pi-visible tool output are replaced with `****`.
 
 ## Install
 
@@ -57,7 +60,7 @@ Example agent flow:
 printf 'OPENAI_API_KEY=%s\n' "$OPENAI_API_KEY" >> .env
 ```
 
-Do not echo or print the secret.
+Avoid echoing or printing real secrets. For redaction testing, use a disposable test value.
 
 ### `getpass_list`
 
@@ -80,3 +83,13 @@ Unset a getpass env var from the current pi process:
 ```
 
 Variables are temporary and last only for the current pi process/session runtime, unless explicitly written somewhere by a later command.
+
+## Verify redaction
+
+Use a disposable value, never a real credential:
+
+1. Run `/getpass PI_GETPASS_TEST` and enter `hello` in the masked prompt.
+2. Run `!echo "$PI_GETPASS_TEST"` to test the direct `!` shell path.
+3. Ask the agent to run `echo "$PI_GETPASS_TEST"` to test tool output.
+
+Both outputs should display `****`. Run `/getpass` again after `/reload` or a restart because tracking is intentionally runtime-local.

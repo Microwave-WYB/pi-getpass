@@ -1,7 +1,13 @@
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { createLocalBashOperations, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
+import {
+	createRedactingBashOperations,
+	overwriteObjectInPlace,
+	redactValue,
+	StreamingRedactor,
+} from "./redaction.ts";
 
 const envNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -36,8 +42,49 @@ const listSchema = Type.Object({});
 type GetpassParams = Static<typeof getpassSchema>;
 type UnsetParams = Static<typeof unsetSchema>;
 
+type SecretStore = Map<string, string>;
+
 export default function (pi: ExtensionAPI) {
-	const trackedSecrets = new Set<string>();
+	const trackedSecrets: SecretStore = new Map();
+	// Keep retired values redacted until this extension runtime ends. A process
+	// that was started before /getpass-unset can still emit the old value.
+	const redactionSecrets = new Set<string>();
+	const streamingRedactor = new StreamingRedactor();
+
+	// Redact streaming tool output as well as finalized results. Updates may be
+	// cumulative snapshots (as bash emits) or deltas (as custom tools may emit).
+	// Keeping the raw stream per tool lets us catch a secret split across update
+	// boundaries instead of checking each partial result in isolation.
+	pi.on("tool_execution_update", (event) => {
+		const redacted = streamingRedactor.redact(event.toolCallId, event.partialResult, redactionSecrets);
+		// Pi emits a shallow copy of this event and does not propagate property
+		// reassignment back to the renderer. Mutate the result object in place too.
+		overwriteObjectInPlace(event.partialResult, redacted);
+		event.partialResult = redacted;
+	});
+
+	pi.on("tool_result", (event) => {
+		const content = redactValue(event.content, redactionSecrets) as typeof event.content;
+		const details = redactValue(event.details, redactionSecrets);
+		return { content, details };
+	});
+
+	// Commands entered directly with Pi's !/!! shell syntax bypass tool events.
+	// Wrap that execution path so both its live chunks and recorded result contain
+	// only redacted output.
+	const localBashOperations = createLocalBashOperations();
+	pi.on("user_bash", () => {
+		if (redactionSecrets.size === 0) return;
+		return { operations: createRedactingBashOperations(localBashOperations, redactionSecrets) };
+	});
+
+	// Keep the completion event safe for renderers that consume it directly.
+	pi.on("tool_execution_end", (event) => {
+		const redacted = redactValue(event.result, redactionSecrets);
+		overwriteObjectInPlace(event.result, redacted);
+		event.result = redacted;
+		streamingRedactor.clear(event.toolCallId);
+	});
 
 	pi.registerTool({
 		name: "getpass",
@@ -48,13 +95,13 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [
 			"Use getpass whenever you need a secret/API key/token from the user; never ask the user to paste secrets into chat.",
 			"When calling getpass, choose a clear exact env var name such as OPENAI_API_KEY, GITHUB_TOKEN, or DATABASE_URL.",
-			"After getpass succeeds, use shell expansion with that exact env var name; do not echo, print, or read back the secret.",
 		],
 		parameters: getpassSchema,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const result = await collectSecret(ctx, params);
 			process.env[result.envVar] = result.secret;
-			trackedSecrets.add(result.envVar);
+			trackedSecrets.set(result.envVar, result.secret);
+			redactionSecrets.add(result.secret);
 
 			return {
 				content: [
@@ -79,7 +126,7 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: ["Use getpass_list to check which getpass env vars are available; it only returns names, never values."],
 		parameters: listSchema,
 		async execute() {
-			const envVars = [...trackedSecrets].filter((name) => process.env[name] !== undefined).sort();
+			const envVars = [...trackedSecrets.keys()].filter((name) => process.env[name] !== undefined).sort();
 			return {
 				content: [
 					{
@@ -103,6 +150,8 @@ export default function (pi: ExtensionAPI) {
 			const envVar = validateEnvVar(params);
 			const existed = process.env[envVar] !== undefined;
 			delete process.env[envVar];
+			const retiredSecret = trackedSecrets.get(envVar);
+			if (retiredSecret !== undefined) redactionSecrets.add(retiredSecret);
 			trackedSecrets.delete(envVar);
 			return {
 				content: [{ type: "text" as const, text: existed ? `Unset ${envVar}.` : `${envVar} was not set.` }],
@@ -117,7 +166,8 @@ export default function (pi: ExtensionAPI) {
 			const envVar = args.trim() || "PI_GETPASS_SECRET";
 			const result = await collectSecret(ctx, { envVar, prompt: `Enter secret for ${envVar}`, overwrite: true });
 			process.env[result.envVar] = result.secret;
-			trackedSecrets.add(result.envVar);
+			trackedSecrets.set(result.envVar, result.secret);
+			redactionSecrets.add(result.secret);
 			ctx.ui.notify(`Stored secret in ${result.envVar} for this pi process.`, "info");
 		},
 	});
@@ -125,7 +175,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("getpass-list", {
 		description: "List getpass env var names currently tracked in this pi runtime.",
 		handler: async (_args, ctx) => {
-			const envVars = [...trackedSecrets].filter((name) => process.env[name] !== undefined).sort();
+			const envVars = [...trackedSecrets.keys()].filter((name) => process.env[name] !== undefined).sort();
 			ctx.ui.notify(envVars.length === 0 ? "No getpass secrets are currently tracked." : `Getpass env vars: ${envVars.join(", ")}`, "info");
 		},
 	});
@@ -136,6 +186,8 @@ export default function (pi: ExtensionAPI) {
 			const envVar = validateEnvVar({ envVar: args.trim() });
 			const existed = process.env[envVar] !== undefined;
 			delete process.env[envVar];
+			const retiredSecret = trackedSecrets.get(envVar);
+			if (retiredSecret !== undefined) redactionSecrets.add(retiredSecret);
 			trackedSecrets.delete(envVar);
 			ctx.ui.notify(existed ? `Unset ${envVar}.` : `${envVar} was not set.`, "info");
 		},
