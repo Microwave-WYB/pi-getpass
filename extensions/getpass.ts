@@ -108,10 +108,10 @@ export default function (pi: ExtensionAPI) {
 			"Use via: \"web\" when the user is remote/on phone — a tailnet single-shot page opens; relay the returned URL to the user (Telegram is approved for this URL).",
 		],
 		parameters: getpassSchema,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const result =
 				params.via === "web"
-					? await collectSecretWeb(ctx, params, signal)
+					? await collectSecretWeb(ctx, params, signal, onUpdate)
 					: await collectSecret(ctx, params);
 			process.env[result.envVar] = result.secret;
 			trackedSecrets.set(result.envVar, result.secret);
@@ -238,6 +238,7 @@ async function collectSecretWeb(
 	ctx: ExtensionContext,
 	params: GetpassParams,
 	signal?: AbortSignal,
+	onUpdate?: (update: unknown) => void,
 ): Promise<{ envVar: string; secret: string; inputChannel: "web"; url: string }> {
 	const envVar = validateEnvVar(params);
 	if (!params.overwrite && process.env[envVar] !== undefined) {
@@ -282,6 +283,16 @@ async function collectSecretWeb(
 	});
 
 	ctx.ui.notify(`🔐 ${prompt}\n请打开链接并在 ${process.env.GETPASS_TTL ?? "90"}s 内提交（单次生效）:\n${url}`, "info");
+
+	// 执行中把 URL 推给 agent（partial result），让 agent 能实时转发（如 Telegram）
+	onUpdate?.({
+		content: [
+			{
+				type: "text" as const,
+				text: `🔐 ${prompt}\n请用户打开此链接并在 ${process.env.GETPASS_TTL ?? "90"}s 内提交（单次生效）:\n${url}`,
+			},
+		],
+	});
 
 	const code = await exited;
 	if (code !== 0) {
