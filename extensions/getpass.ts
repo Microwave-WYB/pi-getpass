@@ -1,5 +1,6 @@
 import { createLocalBashOperations, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
@@ -246,7 +247,9 @@ async function collectSecretWeb(
 	}
 
 	const prompt = params.prompt?.trim() || `Enter secret for ${envVar}`;
-	const cmdStr = process.env.GETPASS_WEB_CMD || "python3 /home/wyb/Projects/pi-supervisor/main/scripts/getpass-web.py";
+	const cmdStr =
+		process.env.GETPASS_WEB_CMD ||
+		`node --experimental-strip-types ${fileURLToPath(new URL("./getpass-web.ts", import.meta.url))}`;
 	const [cmd, ...cmdArgs] = cmdStr.split(/\s+/);
 	const child: ChildProcess = spawn(cmd, [...cmdArgs, prompt], {
 		stdio: ["ignore", "pipe", "inherit"],
