@@ -1,4 +1,5 @@
 import { createLocalBashOperations, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { spawn, type ChildProcess } from "node:child_process";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
@@ -29,6 +30,15 @@ const getpassSchema = Type.Object({
 	allowEmpty: Type.Optional(
 		Type.Boolean({
 			description: "Allow an empty secret. Defaults to false.",
+		}),
+	),
+	via: Type.Optional(
+		Type.Union([
+			Type.Literal("tui"),
+			Type.Literal("web"),
+		], {
+			description:
+				"Input channel: \"tui\" (default — masked TUI prompt) or \"web\" (tailnet single-shot web page, phone-friendly; the URL is notified and returned so the agent can relay it).",
 		}),
 	),
 });
@@ -91,14 +101,18 @@ export default function (pi: ExtensionAPI) {
 		label: "Get Secret",
 		description:
 			"Securely ask the user for a secret through the TUI, without putting the secret in chat/session history, and store it in an agent-chosen temporary environment variable for later tool calls.",
-		promptSnippet: "Securely prompt the user for a secret and store it in a temporary env var.",
+		promptSnippet: "Securely prompt the user for a secret and store it in a temporary env var (TUI or web).",
 		promptGuidelines: [
 			"Use getpass whenever you need a secret/API key/token from the user; never ask the user to paste secrets into chat.",
 			"When calling getpass, choose a clear exact env var name such as OPENAI_API_KEY, GITHUB_TOKEN, or DATABASE_URL.",
+			"Use via: \"web\" when the user is remote/on phone — a tailnet single-shot page opens; relay the returned URL to the user (Telegram is approved for this URL).",
 		],
 		parameters: getpassSchema,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const result = await collectSecret(ctx, params);
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const result =
+				params.via === "web"
+					? await collectSecretWeb(ctx, params, signal)
+					: await collectSecret(ctx, params);
 			process.env[result.envVar] = result.secret;
 			trackedSecrets.set(result.envVar, result.secret);
 			redactionSecrets.add(result.secret);
@@ -107,11 +121,15 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text" as const,
-						text: `Secret captured and stored in temporary environment variable ${result.envVar}. The value was not written to session history.`,
+						text:
+							result.inputChannel === "web"
+								? `Secret request opened. The user can submit at this URL (single-shot, ~90s TTL): ${result.url}`
+								: `Secret captured and stored in temporary environment variable ${result.envVar}. The value was not written to session history.`,
 					},
 				],
 				details: {
 					envVar: result.envVar,
+					inputChannel: result.inputChannel,
 					availableToBash: true,
 				},
 			};
@@ -194,7 +212,7 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 
-async function collectSecret(ctx: ExtensionContext, params: GetpassParams): Promise<{ envVar: string; secret: string }> {
+async function collectSecret(ctx: ExtensionContext, params: GetpassParams): Promise<{ envVar: string; secret: string; inputChannel: "tui" }> {
 	const envVar = validateEnvVar(params);
 	if (!params.overwrite && process.env[envVar] !== undefined) {
 		throw new Error(`${envVar} is already set. Choose a different env var name or pass overwrite: true.`);
@@ -208,7 +226,72 @@ async function collectSecret(ctx: ExtensionContext, params: GetpassParams): Prom
 	if (secret === null) throw new Error("getpass cancelled by user");
 	if (!params.allowEmpty && secret.length === 0) throw new Error("getpass received an empty secret");
 
-	return { envVar, secret };
+	return { envVar, secret, inputChannel: "tui" };
+}
+
+/**
+ * Web mode: spawn the tailnet single-shot server, expose the URL, and wait for
+ * the user's submission. The secret is read straight from the server's stdout
+ * and stored via the same tracked/redacted mechanism as the TUI path.
+ */
+async function collectSecretWeb(
+	ctx: ExtensionContext,
+	params: GetpassParams,
+	signal?: AbortSignal,
+): Promise<{ envVar: string; secret: string; inputChannel: "web"; url: string }> {
+	const envVar = validateEnvVar(params);
+	if (!params.overwrite && process.env[envVar] !== undefined) {
+		throw new Error(`${envVar} is already set. Choose a different env var name or pass overwrite: true.`);
+	}
+
+	const prompt = params.prompt?.trim() || `Enter secret for ${envVar}`;
+	const cmdStr = process.env.GETPASS_WEB_CMD || "python3 /home/wyb/Projects/pi-supervisor/main/scripts/getpass-web.py";
+	const [cmd, ...cmdArgs] = cmdStr.split(/\s+/);
+	const child: ChildProcess = spawn(cmd, [...cmdArgs, prompt], {
+		stdio: ["ignore", "pipe", "inherit"],
+		shell: false,
+	});
+
+	let output = "";
+	let stderrTail = "";
+	child.stdout?.on("data", (d) => (output += d.toString()));
+	child.stderr?.on("data", (d) => (stderrTail = (stderrTail + d.toString()).slice(-400)));
+
+	const exited = new Promise<number | null>((resolve, reject) => {
+		child.once("error", reject);
+		child.once("exit", (code) => resolve(code));
+	});
+	if (signal?.aborted) {
+		child.kill();
+		throw new Error("getpass web cancelled");
+	}
+
+	// First stdout line is the URL.
+	const url = await new Promise<string>((resolve, reject) => {
+		const deadline = Date.now() + 5000;
+		const timer = setInterval(() => {
+			const nl = output.indexOf("\n");
+			if (nl >= 0) {
+				clearInterval(timer);
+				resolve(output.slice(0, nl).trim());
+			} else if (Date.now() > deadline) {
+				clearInterval(timer);
+				reject(new Error("getpass web server did not report a URL"));
+			}
+		}, 50);
+	});
+
+	ctx.ui.notify(`🔐 ${prompt}\n请打开链接并在 ${process.env.GETPASS_TTL ?? "90"}s 内提交（单次生效）:\n${url}`, "info");
+
+	const code = await exited;
+	if (code !== 0) {
+		throw new Error(code === 2 ? "getpass web timed out" : `getpass web failed (exit ${code})${stderrTail ? `: ${stderrTail}` : ""}`);
+	}
+	const lines = output.trimEnd().split("\n");
+	const secret = lines[lines.length - 1] ?? "";
+	if (!params.allowEmpty && secret.length === 0) throw new Error("getpass web received an empty secret");
+
+	return { envVar, secret, inputChannel: "web", url };
 }
 
 function validateEnvVar(params: Pick<UnsetParams, "envVar">): string {
