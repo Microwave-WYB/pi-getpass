@@ -1,4 +1,4 @@
-import { createLocalBashOperations, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { createLocalBashOperations, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -238,7 +238,7 @@ async function collectSecretWeb(
 	ctx: ExtensionContext,
 	params: GetpassParams,
 	signal?: AbortSignal,
-	onUpdate?: (update: { content: unknown[] }) => void,
+	onUpdate?: AgentToolUpdateCallback<unknown>,
 ): Promise<{ envVar: string; secret: string; inputChannel: "web"; url: string }> {
 	const envVar = validateEnvVar(params);
 	if (!params.overwrite && process.env[envVar] !== undefined) {
@@ -292,6 +292,7 @@ async function collectSecretWeb(
 				text: `🔐 ${prompt}\n请用户打开此链接并在 ${process.env.GETPASS_TTL ?? "90"}s 内提交（单次生效）:\n${url}`,
 			},
 		],
+		details: { envVar, url },
 	});
 
 	const code = await exited;
