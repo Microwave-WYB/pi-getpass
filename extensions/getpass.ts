@@ -1,5 +1,6 @@
 import { createLocalBashOperations, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -303,7 +304,17 @@ async function collectSecretWeb(
 		throw new Error(code === 2 ? "getpass web timed out" : `getpass web failed (exit ${code})${stderrTail ? `: ${stderrTail}` : ""}`);
 	}
 	const lines = output.trimEnd().split("\n");
-	const secret = lines[lines.length - 1] ?? "";
+	const last = lines[lines.length - 1] ?? "";
+	// 服务器把秘密写进 tmpfs 文件（0600）并只打印路径；值不进 stdout/日志
+	let secret = last;
+	try {
+		if (last && existsSync(last)) {
+			secret = readFileSync(last, "utf8");
+			unlinkSync(last);
+		}
+	} catch {
+		/* file already gone — fall back to the line */
+	}
 	if (!params.allowEmpty && secret.length === 0) throw new Error("getpass web received an empty secret");
 
 	return { envVar, secret, inputChannel: "web", url };

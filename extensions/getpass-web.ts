@@ -14,6 +14,9 @@
  */
 import http from "node:http";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { execSync } from "node:child_process";
 
 const PROMPT = process.argv[2] ?? "请输入秘密";
@@ -77,7 +80,15 @@ const server = http.createServer((req, res) => {
       const body = Buffer.concat(chunks).toString("utf8");
       const val = new URLSearchParams(body).get("secret") ?? "";
       if (!val) return writeHead(res, 400, "text/plain", "");
-      SECRET = val;
+      // 秘密写入 tmpfs 文件（0600），stdout 只打印路径 —— 值不进日志/转录
+      const dir = process.env.XDG_RUNTIME_DIR || os.tmpdir();
+      const secretFile = path.join(dir, `getpass-${TOKEN}.secret`);
+      try {
+        fs.writeFileSync(secretFile, val, { mode: 0o600 });
+      } catch (err) {
+        return writeHead(res, 500, "text/plain", "");
+      }
+      SECRET_FILE = secretFile;
       writeHead(res, 200, "text/html; charset=utf-8", "<!doctype html><meta charset=utf-8><title>ok</title><body><p>✅ Received — you can close this page.</p></body>");
       server.close();
     });
@@ -86,7 +97,7 @@ const server = http.createServer((req, res) => {
   writeHead(res, 404, "text/plain", "");
 });
 
-let SECRET = "";
+let SECRET_FILE = "";
 server.on("error", (err) => {
   console.error(err);
   process.exit(1);
@@ -98,12 +109,12 @@ server.listen(0, IP, () => {
   }
 });
 
-// TTL 兜底
+// TTL 兜底：超时删掉可能已写的文件
 setTimeout(() => {
-  if (!SECRET) process.exit(2);
+  if (!SECRET_FILE) process.exit(2);
 }, TTL * 1000);
 
 server.on("close", () => {
-  console.log(SECRET);
+  console.log(SECRET_FILE);
   process.exit(0);
 });
