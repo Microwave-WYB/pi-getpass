@@ -238,7 +238,7 @@ async function collectSecretWeb(
 	ctx: ExtensionContext,
 	params: GetpassParams,
 	signal?: AbortSignal,
-	onUpdate?: (update: unknown) => void,
+	onUpdate?: (update: { content: unknown[] }) => void,
 ): Promise<{ envVar: string; secret: string; inputChannel: "web"; url: string }> {
 	const envVar = validateEnvVar(params);
 	if (!params.overwrite && process.env[envVar] !== undefined) {
