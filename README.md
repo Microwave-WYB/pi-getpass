@@ -94,6 +94,26 @@ Unset a getpass env var from the current pi process:
 
 Variables are temporary and last only for the current pi process/session runtime, unless explicitly written somewhere by a later command.
 
+## Development
+
+```bash
+# typecheck (symlink setup must be present in node_modules; see below)
+npx tsc --noEmit
+
+# unit tests (redaction)
+npm test
+
+# web-mode smoke test (needs tailscale; auto-submits a secret to a local server)
+npx tsx tests/smoke-web.ts
+```
+
+`node_modules` contains symlinks to the installed pi packages
+(`@earendil-works/pi-coding-agent`, `pi-tui`, `typebox`) plus the TypeScript
+compiler, so `npx tsc` resolves the real compiler instead of the unrelated
+legacy `tsc` npm package. `tsconfig.json` enables `allowImportingTsExtensions`
+because sources import each other with explicit `.ts` extensions for `tsx` /
+`node --experimental-strip-types` execution.
+
 ## Verify redaction
 
 Use a disposable value, never a real credential:
