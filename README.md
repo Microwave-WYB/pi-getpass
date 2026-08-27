@@ -7,14 +7,17 @@ A pi package that adds a `getpass` tool for collecting secrets safely from the u
 When the agent needs an API key, token, password, or other secret, it calls `getpass` with an exact env var name like `OPENAI_API_KEY`. The package temporarily replaces the normal pi input UI with a masked secret input, stores the secret in `process.env` for the current pi process, and returns only the env var name to the model. The secret value is not written to chat/session history.
 
 
-## Web mode (non-TUI)
+## getpass web (asynchronous, non-TUI lifecycle)
 
-`getpass` accepts `via: "web"` — instead of the TUI masked prompt, a tailnet
-single-shot page opens (default server: `python3 ~/Projects/pi-supervisor/main/scripts/getpass-web.py`,
-override with `GETPASS_WEB_CMD`, TTL via `GETPASS_TTL`). The URL is notified in the
-TUI and returned in the tool result so the agent can relay it (Telegram relay is
-user-approved). The secret is stored through the same tracked/redacted mechanism
-as the TUI path. Smoke test: `npx tsx tests/smoke-web.ts`.
+`getpass` with `via: "web"` implements the **getpass web** flow. It immediately returns a relayable tailnet URL and opaque request ID before submission. A single-use page accepts the secret; background capture then populates only the requested tracked environment variable and activates redaction. The request has a TTL and can be checked, consumed, or cancelled without returning the secret:
+
+```text
+getpass_web_status   { requestId }
+getpass_web_consume  { requestId }
+getpass_web_cancel   { requestId }
+```
+
+Each request is isolated. Duplicate submissions, expiry, cancellation, and session shutdown close the server and remove temporary 0600 artifacts. The secret is never printed or included in chat/history, tool output, logs, intercom messages, or command text. Smoke test: `npx tsx tests/smoke-web.ts`.
 
 ## What this is / is not
 
