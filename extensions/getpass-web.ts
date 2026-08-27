@@ -58,7 +58,7 @@ const MAX_BODY_BYTES = 64 * 1024;
 const DEFAULT_POST_TIMEOUT_MS = 5_000;
 const CLOSE_FALLBACK_MS = 1_000;
 
-function isAllowedBindHost(host: string, allowLoopback: boolean): boolean {
+export function isAllowedBindHost(host: string, allowLoopback: boolean): boolean {
 	if (isIP(host) === 6) {
 		if (host === "::1") return allowLoopback;
 		return host.toLowerCase().startsWith("fd7a:115c:a1e0:");

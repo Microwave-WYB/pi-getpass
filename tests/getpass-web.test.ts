@@ -5,13 +5,13 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import mod from "../extensions/getpass.ts";
-import { startSecureWebServer, WebServerError } from "../extensions/getpass-web.ts";
+import { isAllowedBindHost, startSecureWebServer, WebServerError } from "../extensions/getpass-web.ts";
 
 const disposable = "test-only-getpass-web-value";
 
 type Tool = { execute: (...args: any[]) => Promise<any> };
 
-function extension() {
+function extension(customSecret: () => Promise<string | null> = async () => null) {
 	const tools: Record<string, Tool> = {};
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const messages: Array<{ content: unknown; options: unknown; probe: unknown }> = [];
@@ -28,7 +28,7 @@ function extension() {
 	const ctx: any = {
 		hasUI: true,
 		mode: "tui",
-		ui: { notify() {} },
+		ui: { notify() {}, custom: customSecret },
 	};
 	return { tools, handlers, messages, ctx };
 }
@@ -67,6 +67,7 @@ test("getpass web returns URL and opaque ID before submission, then populates on
 		assert.equal(process.env.GETPASS_WEB_B, undefined);
 		const status = await tools.getpass_web_status.execute("status", { requestId: opened.details.requestId });
 		assert.equal(status.details.status, "ready");
+		assert.equal(status.details.availableToBash, true);
 		const consumed = await tools.getpass_web_consume.execute("consume", { requestId: opened.details.requestId });
 		assert.equal(consumed.details.status, "consumed");
 		assert.equal(JSON.stringify(consumed).includes(disposable), false);
@@ -77,6 +78,57 @@ test("getpass web returns URL and opaque ID before submission, then populates on
 	}
 });
 
+
+test("TUI and web share identity-safe reservations across interleavings", async () => {
+	const oldHost = process.env.GETPASS_WEB_HOST;
+	const oldLoopback = process.env.GETPASS_WEB_ALLOW_LOOPBACK;
+	process.env.GETPASS_WEB_HOST = "127.0.0.1";
+	process.env.GETPASS_WEB_ALLOW_LOOPBACK = "1";
+	delete process.env.GETPASS_WEB_CROSS;
+	try {
+		let resolveTui!: (value: string | null) => void;
+		const shared = extension(() => new Promise<string | null>((resolve) => { resolveTui = resolve; }));
+		const tuiFirst = shared.tools.getpass.execute("tui-first", { envVar: "GETPASS_WEB_CROSS", overwrite: false }, undefined, undefined, shared.ctx);
+		await nextTurn();
+		await assert.rejects(shared.tools.getpass.execute("web-second", { envVar: "GETPASS_WEB_CROSS", overwrite: true, via: "web" }, undefined, undefined, shared.ctx), /pending getpass collection/);
+		resolveTui("tui-first-value");
+		await tuiFirst;
+		assert.equal(process.env.GETPASS_WEB_CROSS, "tui-first-value");
+		const webSecond = await shared.tools.getpass.execute("web-second", { envVar: "GETPASS_WEB_CROSS", overwrite: true, via: "web" }, undefined, undefined, shared.ctx);
+		assert.equal((await fetch(webSecond.details.url, { method: "POST", body: body("web-second-value") })).status, 200);
+		await nextTurn();
+		assert.equal(process.env.GETPASS_WEB_CROSS, "web-second-value");
+		await shared.tools.getpass_web_consume.execute("consume", { requestId: webSecond.details.requestId });
+		await shared.handlers.get("session_shutdown")!();
+
+		let resolveAfterCancel!: (value: string | null) => void;
+		const webFirst = extension(() => new Promise<string | null>((resolve) => { resolveAfterCancel = resolve; }));
+		delete process.env.GETPASS_WEB_CROSS;
+		const pendingWeb = await webFirst.tools.getpass.execute("web-first", { envVar: "GETPASS_WEB_CROSS", via: "web" }, undefined, undefined, webFirst.ctx);
+		await assert.rejects(webFirst.tools.getpass.execute("tui-second", { envVar: "GETPASS_WEB_CROSS", overwrite: true }, undefined, undefined, webFirst.ctx), /pending getpass collection/);
+		await webFirst.tools.getpass_web_cancel.execute("cancel", { requestId: pendingWeb.details.requestId });
+		const tuiAfterCancel = webFirst.tools.getpass.execute("tui-after-cancel", { envVar: "GETPASS_WEB_CROSS", overwrite: true }, undefined, undefined, webFirst.ctx);
+		resolveAfterCancel("tui-after-cancel-value");
+		await tuiAfterCancel;
+		assert.equal(process.env.GETPASS_WEB_CROSS, "tui-after-cancel-value");
+		await webFirst.handlers.get("session_shutdown")!();
+
+		process.env.GETPASS_WEB_CROSS = "existing-value";
+		let resolveOverwrite!: (value: string | null) => void;
+		const overwrite = extension(() => new Promise<string | null>((resolve) => { resolveOverwrite = resolve; }));
+		await assert.rejects(overwrite.tools.getpass.execute("no-overwrite", { envVar: "GETPASS_WEB_CROSS" }, undefined, undefined, overwrite.ctx), /already set/);
+		const overwriteExisting = overwrite.tools.getpass.execute("overwrite", { envVar: "GETPASS_WEB_CROSS", overwrite: true }, undefined, undefined, overwrite.ctx);
+		resolveOverwrite("replacement-value");
+		await overwriteExisting;
+		assert.equal(process.env.GETPASS_WEB_CROSS, "replacement-value");
+		await overwrite.handlers.get("session_shutdown")!();
+	} finally {
+		delete process.env.GETPASS_WEB_CROSS;
+		if (oldHost === undefined) delete process.env.GETPASS_WEB_HOST; else process.env.GETPASS_WEB_HOST = oldHost;
+		if (oldLoopback === undefined) delete process.env.GETPASS_WEB_ALLOW_LOOPBACK; else process.env.GETPASS_WEB_ALLOW_LOOPBACK = oldLoopback;
+	}
+
+});
 test("same-env concurrent startup has one atomic reservation and failed startup rolls it back", async () => {
 	const oldHost = process.env.GETPASS_WEB_HOST;
 	const oldLoopback = process.env.GETPASS_WEB_ALLOW_LOOPBACK;
@@ -159,6 +211,8 @@ test("server request IDs reject before startup or artifact construction", async 
 
 
 test("web bind host accepts only explicit loopback or Tailscale ranges", async () => {
+	assert.equal(isAllowedBindHost("fd7a:115c:a1e0::1", false), true);
+	assert.equal(isAllowedBindHost("fd7a:115c:a1e1::1", false), false);
 	for (const host of ["0.0.0.0", "::", "192.168.1.20", "100.63.0.1", "100.128.0.1", "fd00::1"]) {
 		await assert.rejects(startSecureWebServer({ host, prompt: "host", ttlMs: 100 }), /allowed tailnet/);
 	}
@@ -196,6 +250,44 @@ test("ready requests survive terminal pressure until consume", async () => {
 	assert.equal(process.env.GETPASS_WEB_PRESSURE_0, undefined);
 });
 
+test("active web request cap rejects before startup and recovers after cancellation", async () => {
+	const oldHost = process.env.GETPASS_WEB_HOST;
+	const oldLoopback = process.env.GETPASS_WEB_ALLOW_LOOPBACK;
+	const oldRuntime = process.env.XDG_RUNTIME_DIR;
+	const directory = mkdtempSync(join("/tmp", "getpass-web-cap-"));
+	process.env.GETPASS_WEB_HOST = "127.0.0.1";
+	process.env.GETPASS_WEB_ALLOW_LOOPBACK = "1";
+	process.env.XDG_RUNTIME_DIR = directory;
+	const opened: Array<{ envVar: string; requestId: string }> = [];
+	let handlers: Map<string, (...args: any[]) => any> | undefined;
+	try {
+		const active = extension();
+		handlers = active.handlers;
+		for (let i = 0; i < 256; i++) {
+			const envVar = `GETPASS_WEB_CAP_${i}`;
+			const result = await active.tools.getpass.execute(`cap-${i}`, { envVar, via: "web" }, undefined, undefined, active.ctx);
+			opened.push({ envVar, requestId: result.details.requestId });
+		}
+		await assert.rejects(active.tools.getpass.execute("over-cap", { envVar: "GETPASS_WEB_CAP_OVER", via: "web" }, undefined, undefined, active.ctx), /active request limit/);
+		assert.equal(process.env.GETPASS_WEB_CAP_OVER, undefined);
+		assert.deepEqual(readdirSync(directory), []);
+		await active.tools.getpass_web_cancel.execute("cancel", { requestId: opened[0]!.requestId });
+		const recovered = await active.tools.getpass.execute("recovered", { envVar: "GETPASS_WEB_CAP_OVER", via: "web" }, undefined, undefined, active.ctx);
+		assert.match(recovered.details.requestId, /^[a-f0-9]{36}$/);
+		await active.handlers.get("session_shutdown")!();
+		assert.deepEqual(readdirSync(directory), []);
+	} finally {
+		if (handlers) await handlers.get("session_shutdown")?.();
+		for (let i = 0; i < 256; i++) delete process.env[`GETPASS_WEB_CAP_${i}`];
+		delete process.env.GETPASS_WEB_CAP_OVER;
+		if (oldHost === undefined) delete process.env.GETPASS_WEB_HOST; else process.env.GETPASS_WEB_HOST = oldHost;
+		if (oldLoopback === undefined) delete process.env.GETPASS_WEB_ALLOW_LOOPBACK; else process.env.GETPASS_WEB_ALLOW_LOOPBACK = oldLoopback;
+		if (oldRuntime === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = oldRuntime;
+		rmSync(directory, { recursive: true, force: true });
+	}
+
+});
+
 test("ready expiry transitions to expired while preserving tracked redaction state", async () => {
 	const oldHost = process.env.GETPASS_WEB_HOST;
 	const oldLoopback = process.env.GETPASS_WEB_ALLOW_LOOPBACK;
@@ -212,7 +304,10 @@ test("ready expiry transitions to expired while preserving tracked redaction sta
 		Date.now = () => capturedAt + 15 * 60 * 1000 + 1;
 		const expired = await tools.getpass_web_status.execute("expiry-status", { requestId: opened.details.requestId });
 		assert.equal(expired.details.status, "expired");
+		assert.equal(expired.details.availableToBash, true);
 		assert.equal(process.env.GETPASS_WEB_EXPIRY, "expiry-value");
+		const redacted = handlers.get("tool_result")!({ content: [{ type: "text", text: "expiry-value" }], details: {} });
+		assert.deepEqual(redacted.content, [{ type: "text", text: "****" }]);
 		await handlers.get("session_shutdown")!();
 	} finally {
 		Date.now = oldNow;
@@ -334,6 +429,7 @@ test("session shutdown cancels pending web requests and redaction starts on capt
 		const opened = await tools.getpass.execute("id", { envVar: "GETPASS_WEB_C", via: "web" }, undefined, undefined, ctx);
 		await handlers.get("session_shutdown")!();
 		assert.equal((await tools.getpass_web_status.execute("status", { requestId: opened.details.requestId })).details.status, "cancelled");
+		assert.equal((await tools.getpass_web_status.execute("status", { requestId: opened.details.requestId })).details.availableToBash, false);
 		assert.equal(process.env.GETPASS_WEB_C, undefined);
 
 		const next = extension();
@@ -347,6 +443,30 @@ test("session shutdown cancels pending web requests and redaction starts on capt
 		if (oldHost === undefined) delete process.env.GETPASS_WEB_HOST; else process.env.GETPASS_WEB_HOST = oldHost;
 		if (oldLoopback === undefined) delete process.env.GETPASS_WEB_ALLOW_LOOPBACK; else process.env.GETPASS_WEB_ALLOW_LOOPBACK = oldLoopback;
 	}
+});
+
+test("uncaptured web expiry remains unavailable", async () => {
+	const oldHost = process.env.GETPASS_WEB_HOST;
+	const oldLoopback = process.env.GETPASS_WEB_ALLOW_LOOPBACK;
+	const oldTtl = process.env.GETPASS_TTL;
+	process.env.GETPASS_WEB_HOST = "127.0.0.1";
+	process.env.GETPASS_WEB_ALLOW_LOOPBACK = "1";
+	process.env.GETPASS_TTL = "1";
+	try {
+		const expired = extension();
+		const opened = await expired.tools.getpass.execute("uncaptured-expiry", { envVar: "GETPASS_WEB_UNCAPTURED", via: "web" }, undefined, undefined, expired.ctx);
+		await new Promise<void>((resolve) => setTimeout(resolve, 1_100));
+		const status = await expired.tools.getpass_web_status.execute("expiry-status", { requestId: opened.details.requestId });
+		assert.equal(status.details.status, "expired");
+		assert.equal(status.details.availableToBash, false);
+		await expired.handlers.get("session_shutdown")!();
+	} finally {
+		delete process.env.GETPASS_WEB_UNCAPTURED;
+		if (oldHost === undefined) delete process.env.GETPASS_WEB_HOST; else process.env.GETPASS_WEB_HOST = oldHost;
+		if (oldLoopback === undefined) delete process.env.GETPASS_WEB_ALLOW_LOOPBACK; else process.env.GETPASS_WEB_ALLOW_LOOPBACK = oldLoopback;
+		if (oldTtl === undefined) delete process.env.GETPASS_TTL; else process.env.GETPASS_TTL = oldTtl;
+	}
+
 });
 
 const piAvailable = spawnSync("pi", ["--version"], { encoding: "utf8" }).status === 0;

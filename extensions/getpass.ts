@@ -13,6 +13,7 @@ import { startSecureWebServer, type SecureWebServer, WebServerError } from "./ge
 const MAX_TERMINAL_WEB_REQUESTS = 128;
 const TERMINAL_WEB_RETENTION_MS = 15 * 60 * 1000;
 const READY_WEB_RETENTION_MS = 15 * 60 * 1000;
+const MAX_ACTIVE_WEB_REQUESTS = 256;
 const envNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const getpassSchema = Type.Object({
 	envVar: Type.String({ description: "Exact temporary environment variable name to populate, for example OPENAI_API_KEY or GITHUB_TOKEN." }),
@@ -37,6 +38,7 @@ type WebRequest = {
 	generation: symbol;
 	terminalAt?: number;
 	readyTimer?: NodeJS.Timeout;
+	captured: boolean;
 	server: SecureWebServer;
 	state: WebState;
 	completion: Promise<void>;
@@ -85,8 +87,13 @@ export default function (pi: ExtensionAPI) {
 			if (params.via === "web") {
 				return await openWebRequest(ctx, params, signal, webRequests, reservedEnvVars, trackedSecrets, redactionSecrets, lifecycle, pi);
 			}
-			const result = await collectSecret(ctx, params);
-			storeSecret(result.envVar, result.secret, trackedSecrets, redactionSecrets);
+			const result = await collectSecret(ctx, params, signal, reservedEnvVars);
+			try {
+				if (reservedEnvVars.get(result.envVar) !== result.reservation) throw new Error("getpass reservation ownership was lost");
+				storeSecret(result.envVar, result.secret, trackedSecrets, redactionSecrets);
+			} finally {
+				releaseReservation(reservedEnvVars, result.envVar, result.reservation);
+			}
 			return {
 				content: [{ type: "text" as const, text: `Secret captured and stored in temporary environment variable ${result.envVar}. The value was not written to session history.` }],
 				details: { envVar: result.envVar, inputChannel: "tui", availableToBash: true },
@@ -102,7 +109,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: webRequestSchema,
 		async execute(_id, params) {
 			const request = requireWebRequest(params, webRequests);
-			return safeWebResult(request, "status");
+			return safeWebResult(request, "status", trackedSecrets);
 		},
 	});
 	pi.registerTool({
@@ -119,7 +126,7 @@ export default function (pi: ExtensionAPI) {
 				request.terminalAt = Date.now();
 				pruneWebRequests(webRequests);
 			}
-			return safeWebResult(request, "consume");
+			return safeWebResult(request, "consume", trackedSecrets);
 		},
 	});
 	pi.registerTool({
@@ -137,7 +144,7 @@ export default function (pi: ExtensionAPI) {
 				releaseReservation(reservedEnvVars, request.envVar, request.reservation);
 				await request.server.cancel();
 			}
-			return safeWebResult(request, "cancel");
+			return safeWebResult(request, "cancel", trackedSecrets);
 		},
 	});
 
@@ -167,8 +174,13 @@ export default function (pi: ExtensionAPI) {
 		description: "Securely prompt for a secret. Usage: /getpass ENV_VAR",
 		handler: async (args, ctx) => {
 			const envVar = args.trim() || "PI_GETPASS_SECRET";
-			const result = await collectSecret(ctx, { envVar, prompt: `Enter secret for ${envVar}`, overwrite: true });
-			storeSecret(result.envVar, result.secret, trackedSecrets, redactionSecrets);
+			const result = await collectSecret(ctx, { envVar, prompt: `Enter secret for ${envVar}`, overwrite: true }, undefined, reservedEnvVars);
+			try {
+				if (reservedEnvVars.get(result.envVar) !== result.reservation) throw new Error("getpass reservation ownership was lost");
+				storeSecret(result.envVar, result.secret, trackedSecrets, redactionSecrets);
+			} finally {
+				releaseReservation(reservedEnvVars, result.envVar, result.reservation);
+			}
 			ctx.ui.notify(`Stored secret in ${result.envVar} for this pi process.`, "info");
 		},
 	});
@@ -253,14 +265,35 @@ async function unsetSecret(params: UnsetParams, tracked: Map<string, string>, re
 	return { content: [{ type: "text" as const, text: existed ? `Unset ${envVar}.` : `${envVar} was not set.` }], details: { envVar, existed } };
 }
 
-async function collectSecret(ctx: ExtensionContext, params: GetpassParams): Promise<{ envVar: string; secret: string }> {
+type CollectedSecret = { envVar: string; secret: string; reservation: symbol };
+
+function reserveEnvVar(envVar: string, overwrite: boolean, reserved: Map<string, symbol>): symbol {
+	if (reserved.has(envVar)) throw new Error(`${envVar} already has a pending getpass collection.`);
+	if (!overwrite && process.env[envVar] !== undefined) throw new Error(`${envVar} is already set. Choose another env var or pass overwrite: true.`);
+	const reservation = Symbol(`getpass ${envVar}`);
+	reserved.set(envVar, reservation);
+	return reservation;
+}
+
+async function collectSecret(ctx: ExtensionContext, params: GetpassParams, signal: AbortSignal | undefined, reserved: Map<string, symbol>): Promise<CollectedSecret> {
 	const envVar = validateEnvVar(params);
-	if (!params.overwrite && process.env[envVar] !== undefined) throw new Error(`${envVar} is already set. Choose another env var or pass overwrite: true.`);
-	if (!ctx.hasUI || ctx.mode !== "tui") throw new Error("getpass requires the interactive pi TUI so the secret is not exposed in session history.");
-	const secret = await promptSecret(ctx, params.prompt?.trim() || `Enter secret for ${envVar}`, envVar);
-	if (secret === null) throw new Error("getpass cancelled by user");
-	if (!params.allowEmpty && secret.length === 0) throw new Error("getpass received an empty secret");
-	return { envVar, secret };
+	if (signal?.aborted) throw new Error("getpass cancelled by user");
+	const reservation = reserveEnvVar(envVar, params.overwrite === true, reserved);
+	const releaseOnAbort = () => releaseReservation(reserved, envVar, reservation);
+	signal?.addEventListener("abort", releaseOnAbort, { once: true });
+	try {
+		if (!ctx.hasUI || ctx.mode !== "tui") throw new Error("getpass requires the interactive pi TUI so the secret is not exposed in session history.");
+		const secret = await promptSecret(ctx, params.prompt?.trim() || `Enter secret for ${envVar}`, envVar);
+		if (signal?.aborted) throw new Error("getpass cancelled by user");
+		if (secret === null) throw new Error("getpass cancelled by user");
+		if (!params.allowEmpty && secret.length === 0) throw new Error("getpass received an empty secret");
+		return { envVar, secret, reservation };
+	} catch (error) {
+		releaseReservation(reserved, envVar, reservation);
+		throw error;
+	} finally {
+		signal?.removeEventListener("abort", releaseOnAbort);
+	}
 }
 
 async function openWebRequest(
@@ -276,11 +309,17 @@ async function openWebRequest(
 	) {
 	const envVar = validateEnvVar(params);
 	if (lifecycle.shuttingDown) throw new Error("getpass web session is shutting down");
-	if (!params.overwrite && process.env[envVar] !== undefined) throw new Error(`${envVar} is already set. Choose another env var or pass overwrite: true.`);
-	if (reserved.has(envVar)) throw new Error(`${envVar} already has a pending getpass web request.`);
 	if (signal?.aborted) throw new Error("getpass web cancelled");
-	const reservation = Symbol(`getpass web ${envVar}`);
-	reserved.set(envVar, reservation);
+	let reservation: symbol | undefined;
+	try {
+		reservation = reserveEnvVar(envVar, params.overwrite === true, reserved);
+		const active = [...requests.values()].filter((request) => request.state === "pending" || request.state === "ready").length + lifecycle.startingServers.size;
+		if (active >= MAX_ACTIVE_WEB_REQUESTS) throw new Error(`getpass web active request limit (${MAX_ACTIVE_WEB_REQUESTS}) reached`);
+	} catch (error) {
+		if (reservation) releaseReservation(reserved, envVar, reservation);
+		throw error;
+	}
+	if (!reservation) throw new Error("getpass web reservation was not acquired");
 	const release = () => releaseReservation(reserved, envVar, reservation);
 	const ttl = Number.parseInt(process.env.GETPASS_TTL ?? "90", 10);
 	const startup = startSecureWebServer({
@@ -304,7 +343,7 @@ async function openWebRequest(
 		throw new Error(signal?.aborted ? "getpass web cancelled" : "getpass web session is shutting down");
 	}
 	lifecycle.startingServers.delete(startup);
-	const request: WebRequest = { id: server.requestId, envVar, reservation, generation: lifecycle.generation, server, state: "pending", completion: Promise.resolve() };
+	const request: WebRequest = { id: server.requestId, envVar, reservation, generation: lifecycle.generation, captured: false, server, state: "pending", completion: Promise.resolve() };
 	requests.set(request.id, request);
 	const abort = () => {
 		if (request.state !== "pending") return;
@@ -329,6 +368,7 @@ async function openWebRequest(
 			return;
 		}
 		storeSecret(envVar, secret, tracked, redacted);
+		request.captured = true;
 		release();
 		request.state = "ready";
 		request.terminalAt = Date.now();
@@ -366,10 +406,11 @@ function requireWebRequest(params: WebRequestParams, requests: Map<string, WebRe
 	return request;
 }
 
-function safeWebResult(request: WebRequest, operation: string) {
+function safeWebResult(request: WebRequest, operation: string, tracked: Map<string, string>) {
+	const availableToBash = request.captured && tracked.has(request.envVar) && process.env[request.envVar] !== undefined;
 	return {
 		content: [{ type: "text" as const, text: `getpass web ${operation}: ${request.state} (${request.id})` }],
-		details: { requestId: request.id, envVar: request.envVar, status: request.state, availableToBash: request.state === "ready" || request.state === "consumed" },
+		details: { requestId: request.id, envVar: request.envVar, status: request.state, availableToBash },
 	};
 }
 
