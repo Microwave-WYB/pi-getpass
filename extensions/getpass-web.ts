@@ -11,6 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { isIP, type Socket } from "node:net";
 
 export type WebServerState = "pending" | "submitted" | "cancelled" | "expired" | "closed";
 
@@ -30,6 +31,9 @@ export interface SecureWebServerOptions {
 	allowEmpty?: boolean;
 	host?: string;
 	requestId?: string;
+	postTimeoutMs?: number;
+	/** Test-only fault injection; never carries secret data. */
+	artifactFailure?: "after-write" | "after-chmod";
 }
 
 export interface SecureWebSubmission {
@@ -49,19 +53,41 @@ export interface SecureWebServer {
 
 const DEFAULT_TTL_MS = 90_000;
 const MAX_BODY_BYTES = 64 * 1024;
+const DEFAULT_POST_TIMEOUT_MS = 5_000;
+const CLOSE_FALLBACK_MS = 1_000;
+
+function isAllowedBindHost(host: string, allowLoopback: boolean): boolean {
+	if (isIP(host) === 6) {
+		if (host === "::1") return allowLoopback;
+		return host.toLowerCase().startsWith("fd7a:115c:a1e0:");
+	}
+	if (isIP(host) !== 4) return false;
+	const octets = host.split(".").map(Number);
+	if (octets[0] === 127) return allowLoopback;
+	return octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127;
+}
+
+function validateBindHost(host: string, allowLoopback: boolean): string {
+	if (!isAllowedBindHost(host, allowLoopback)) throw new WebServerError("failed", "getpass web bind host is not an allowed tailnet address");
+	return host;
+}
 
 function configuredHost(): string {
-	if (process.env.GETPASS_WEB_HOST) return process.env.GETPASS_WEB_HOST;
+	const override = process.env.GETPASS_WEB_HOST?.trim();
+	if (override) return validateBindHost(override, process.env.GETPASS_WEB_ALLOW_LOOPBACK === "1");
 	try {
 		const output = execFileSync("tailscale", ["ip", "-4"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
 		for (const line of output.split("\n")) {
 			const ip = line.trim();
-			if (ip.startsWith("100.")) return ip;
+			if (ip) {
+				try { return validateBindHost(ip, false); } catch { /* inspect the next address. */ }
+			}
 		}
 	} catch {
 		// The caller receives a generic startup failure; no command output is logged.
 	}
 	throw new WebServerError("failed", "getpass web requires a tailnet address");
+
 }
 
 function escapeHtml(value: string): string {
@@ -102,7 +128,8 @@ function unlinkQuietly(file: string | undefined): void {
 }
 
 export async function startSecureWebServer(options: SecureWebServerOptions): Promise<SecureWebServer> {
-	const host = options.host ?? configuredHost();
+	const requestedHost = options.host?.trim();
+	const host = requestedHost ? validateBindHost(requestedHost, true) : configuredHost();
 	const requestId = options.requestId ?? crypto.randomBytes(18).toString("hex");
 	const token = crypto.randomBytes(24).toString("hex");
 	const ttlMs = Math.max(1, options.ttlMs);
@@ -123,7 +150,7 @@ export async function startSecureWebServer(options: SecureWebServerOptions): Pro
 	// handler also prevents an unhandled rejection during host shutdown.
 	submission.catch(() => undefined);
 
-	let closeServer: () => Promise<void>;
+	let closeServer: (force?: boolean) => Promise<void>;
 	const server = http.createServer((req, res) => {
 		const requestUrl = req.url ?? "/";
 		if (req.method === "GET") {
@@ -134,6 +161,9 @@ export async function startSecureWebServer(options: SecureWebServerOptions): Pro
 		}
 		if (req.method !== "POST" || !samePath(requestUrl, `/${token}`)) return writeResponse(res, 404, "text/plain");
 		if (currentState !== "pending") return writeResponse(res, currentState === "submitted" ? 409 : 410, "text/plain");
+		const postTimeoutMs = Math.max(1, options.postTimeoutMs ?? DEFAULT_POST_TIMEOUT_MS);
+		const postTimer = setTimeout(() => req.destroy(), postTimeoutMs);
+		req.once("close", () => clearTimeout(postTimer));
 
 		let size = 0;
 		const chunks: Buffer[] = [];
@@ -153,25 +183,34 @@ export async function startSecureWebServer(options: SecureWebServerOptions): Pro
 			try {
 				fs.writeFileSync(artifactPath, value, { encoding: "utf8", mode: 0o600, flag: "wx" });
 				fs.chmodSync(artifactPath, 0o600);
+				if (options.artifactFailure === "after-write") throw new Error("injected artifact write failure");
+				if (options.artifactFailure === "after-chmod") throw new Error("injected artifact chmod failure");
 			} catch {
+				unlinkQuietly(artifactPath);
 				currentState = "closed";
 				artifactPath = undefined;
 				if (!submissionSettled) {
 					submissionSettled = true;
 					rejectSubmission(new WebServerError("failed"));
 				}
+				const failureResponse = writeResponse(res, 500, "text/plain");
 				void closeServer();
-				return writeResponse(res, 500, "text/plain");
+				return failureResponse;
 			}
 			if (!submissionSettled) {
 				submissionSettled = true;
 				resolveSubmission({ artifactPath });
 			}
 			writeResponse(res, 200, "text/html; charset=utf-8", "<!doctype html><meta charset=utf-8><title>ok</title><body><p>✅ Received — you can close this page.</p></body>");
-			void closeServer();
+			void closeServer(false);
 		});
 	});
 
+	const sockets = new Set<Socket>();
+	server.on("connection", (socket) => {
+		sockets.add(socket);
+		socket.once("close", () => sockets.delete(socket));
+	});
 	server.on("error", () => {
 		if (!submissionSettled) {
 			submissionSettled = true;
@@ -179,12 +218,24 @@ export async function startSecureWebServer(options: SecureWebServerOptions): Pro
 		}
 	});
 
-	closeServer = (): Promise<void> => {
+	closeServer = (force = true): Promise<void> => {
 		if (closePromise) return closePromise;
 		if (timer) clearTimeout(timer);
 		closePromise = new Promise((resolve) => {
-			if (!server.listening) return resolve();
-			server.close(() => resolve());
+			let finished = false;
+			const finish = () => {
+				if (finished) return;
+				finished = true;
+				clearTimeout(fallback);
+				resolve();
+			};
+			const fallback = setTimeout(finish, CLOSE_FALLBACK_MS);
+			if (!server.listening) return finish();
+			server.close(finish);
+			if (force) {
+				for (const socket of sockets) socket.destroy();
+				(server as http.Server & { closeAllConnections?: () => void }).closeAllConnections?.();
+			}
 		});
 		return closePromise;
 	};
@@ -216,7 +267,8 @@ export async function startSecureWebServer(options: SecureWebServerOptions): Pro
 	}, ttlMs);
 
 	const port = (server.address() as { port: number }).port;
-	const url = `http://${host}:${port}/${token}`;
+	const displayHost = host.includes(":") ? `[${host}]` : host;
+	const url = `http://${displayHost}:${port}/${token}`;
 	return {
 		requestId,
 		url,

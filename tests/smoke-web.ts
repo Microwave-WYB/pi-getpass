@@ -2,6 +2,7 @@
 import mod from "../extensions/getpass.ts";
 
 process.env.GETPASS_WEB_HOST = "127.0.0.1";
+process.env.GETPASS_WEB_ALLOW_LOOPBACK = "1";
 const tools: Record<string, any> = {};
 const api: any = {
 	on: () => {},

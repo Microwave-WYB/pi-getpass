@@ -1,4 +1,4 @@
-import { createLocalBashOperations, type AgentToolUpdateCallback, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { createLocalBashOperations, type ExtensionAPI, type ExtensionContext, type Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import { Input, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
@@ -10,6 +10,8 @@ import {
 } from "./redaction.ts";
 import { startSecureWebServer, type SecureWebServer, WebServerError } from "./getpass-web.ts";
 
+const MAX_TERMINAL_WEB_REQUESTS = 128;
+const TERMINAL_WEB_RETENTION_MS = 15 * 60 * 1000;
 const envNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const getpassSchema = Type.Object({
 	envVar: Type.String({ description: "Exact temporary environment variable name to populate, for example OPENAI_API_KEY or GITHUB_TOKEN." }),
@@ -25,10 +27,14 @@ type GetpassParams = Static<typeof getpassSchema>;
 type UnsetParams = Static<typeof unsetSchema>;
 type WebRequestParams = Static<typeof webRequestSchema>;
 type WebState = "pending" | "ready" | "expired" | "cancelled" | "failed" | "consumed";
+type WebLifecycle = { generation: symbol; shuttingDown: boolean; startingServers: Set<Promise<SecureWebServer>> };
 
 type WebRequest = {
 	id: string;
 	envVar: string;
+	reservation: symbol;
+	generation: symbol;
+	terminalAt?: number;
 	server: SecureWebServer;
 	state: WebState;
 	completion: Promise<void>;
@@ -40,7 +46,8 @@ export default function (pi: ExtensionAPI) {
 	const redactionSecrets = new Set<string>();
 	const streamingRedactor = new StreamingRedactor();
 	const webRequests = new Map<string, WebRequest>();
-	const reservedEnvVars = new Set<string>();
+	const reservedEnvVars = new Map<string, symbol>();
+	const lifecycle: WebLifecycle = { generation: Symbol("getpass web session"), shuttingDown: false, startingServers: new Set<Promise<SecureWebServer>>() };
 	const eventApi = pi as ExtensionAPI & { on: (event: string, handler: (...args: any[]) => any) => unknown };
 
 	pi.on("tool_execution_update", (event) => {
@@ -72,9 +79,9 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Securely collect a secret into a temporary env var (TUI or getpass web).",
 		promptGuidelines: ["Use getpass instead of asking for secrets in chat.", "For remote users use via: web; relay only its URL and opaque request ID."],
 		parameters: getpassSchema,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (params.via === "web") {
-				return await openWebRequest(ctx, params, signal, onUpdate, webRequests, reservedEnvVars, trackedSecrets, redactionSecrets);
+				return await openWebRequest(ctx, params, signal, webRequests, reservedEnvVars, trackedSecrets, redactionSecrets, lifecycle, pi);
 			}
 			const result = await collectSecret(ctx, params);
 			storeSecret(result.envVar, result.secret, trackedSecrets, redactionSecrets);
@@ -104,7 +111,11 @@ export default function (pi: ExtensionAPI) {
 		parameters: webRequestSchema,
 		async execute(_id, params) {
 			const request = requireWebRequest(params, webRequests);
-			if (request.state === "ready") request.state = "consumed";
+			if (request.state === "ready") {
+				request.state = "consumed";
+				request.terminalAt = Date.now();
+				pruneWebRequests(webRequests);
+			}
 			return safeWebResult(request, "consume");
 		},
 	});
@@ -118,7 +129,9 @@ export default function (pi: ExtensionAPI) {
 			const request = requireWebRequest(params, webRequests);
 			if (request.state === "pending") {
 				request.state = "cancelled";
-				reservedEnvVars.delete(request.envVar);
+				request.terminalAt = Date.now();
+				pruneWebRequests(webRequests);
+				releaseReservation(reservedEnvVars, request.envVar, request.reservation);
 				await request.server.cancel();
 			}
 			return safeWebResult(request, "cancel");
@@ -173,12 +186,18 @@ export default function (pi: ExtensionAPI) {
 
 	// The session event is the authoritative extension lifecycle cleanup hook.
 	eventApi.on("session_shutdown", async () => {
+		lifecycle.shuttingDown = true;
 		await Promise.all([...webRequests.values()].map(async (request) => {
 			if (request.state === "pending") {
 				request.state = "cancelled";
-				reservedEnvVars.delete(request.envVar);
+				request.terminalAt = Date.now();
+				pruneWebRequests(webRequests);
+				releaseReservation(reservedEnvVars, request.envVar, request.reservation);
 			}
 			await request.server.cancel();
+		}));
+		await Promise.all([...lifecycle.startingServers].map(async (startup) => {
+			try { await (await startup).cancel(); } catch { /* startup failure already cleaned itself. */ }
 		}));
 	});
 }
@@ -187,6 +206,20 @@ function storeSecret(envVar: string, secret: string, tracked: Map<string, string
 	process.env[envVar] = secret;
 	tracked.set(envVar, secret);
 	if (secret.length > 0) redacted.add(secret);
+}
+
+function releaseReservation(reserved: Map<string, symbol>, envVar: string, owner: symbol): void {
+	if (reserved.get(envVar) === owner) reserved.delete(envVar);
+}
+
+function pruneWebRequests(requests: Map<string, WebRequest>): void {
+	const now = Date.now();
+	const terminal = [...requests.values()].filter((request) => request.state !== "pending" && request.terminalAt !== undefined);
+	for (const request of terminal) {
+		if (now - (request.terminalAt ?? now) > TERMINAL_WEB_RETENTION_MS) requests.delete(request.id);
+	}
+	const retained = [...requests.values()].filter((request) => request.state !== "pending" && request.terminalAt !== undefined).sort((a, b) => (a.terminalAt ?? 0) - (b.terminalAt ?? 0));
+	for (const request of retained.slice(0, Math.max(0, retained.length - MAX_TERMINAL_WEB_REQUESTS))) requests.delete(request.id);
 }
 
 function validateEnvVar(params: Pick<UnsetParams, "envVar">): string {
@@ -219,33 +252,51 @@ async function openWebRequest(
 	ctx: ExtensionContext,
 	params: GetpassParams,
 	signal: AbortSignal | undefined,
-	onUpdate: AgentToolUpdateCallback<unknown> | undefined,
 	requests: Map<string, WebRequest>,
-	reserved: Set<string>,
+	reserved: Map<string, symbol>,
 	tracked: Map<string, string>,
 	redacted: Set<string>,
-) {
+	lifecycle: WebLifecycle,
+	pi: ExtensionAPI,
+	) {
 	const envVar = validateEnvVar(params);
+	if (lifecycle.shuttingDown) throw new Error("getpass web session is shutting down");
 	if (!params.overwrite && process.env[envVar] !== undefined) throw new Error(`${envVar} is already set. Choose another env var or pass overwrite: true.`);
 	if (reserved.has(envVar)) throw new Error(`${envVar} already has a pending getpass web request.`);
 	if (signal?.aborted) throw new Error("getpass web cancelled");
+	const reservation = Symbol(`getpass web ${envVar}`);
+	reserved.set(envVar, reservation);
+	const release = () => releaseReservation(reserved, envVar, reservation);
 	const ttl = Number.parseInt(process.env.GETPASS_TTL ?? "90", 10);
-	const server = await startSecureWebServer({
+	const startup = startSecureWebServer({
 		prompt: params.prompt?.trim() || `Enter secret for ${envVar}`,
 		ttlMs: (Number.isFinite(ttl) ? Math.max(1, ttl) : 90) * 1000,
 		allowEmpty: params.allowEmpty,
 	});
-	const request: WebRequest = { id: server.requestId, envVar, server, state: "pending", completion: Promise.resolve() };
-	if (signal?.aborted) {
-		await server.cancel();
-		throw new Error("getpass web cancelled");
+	lifecycle.startingServers.add(startup);
+	let server: SecureWebServer;
+	try {
+		server = await startup;
+	} catch (error) {
+		lifecycle.startingServers.delete(startup);
+		release();
+		throw error;
 	}
+	if (signal?.aborted || lifecycle.shuttingDown) {
+		release();
+		await server.cancel();
+		lifecycle.startingServers.delete(startup);
+		throw new Error(signal?.aborted ? "getpass web cancelled" : "getpass web session is shutting down");
+	}
+	lifecycle.startingServers.delete(startup);
+	const request: WebRequest = { id: server.requestId, envVar, reservation, generation: lifecycle.generation, server, state: "pending", completion: Promise.resolve() };
 	requests.set(request.id, request);
-	reserved.add(envVar);
 	const abort = () => {
 		if (request.state !== "pending") return;
 		request.state = "cancelled";
-		reserved.delete(envVar);
+		request.terminalAt = Date.now();
+		pruneWebRequests(requests);
+		release();
 		void server.cancel();
 	};
 	signal?.addEventListener("abort", abort, { once: true });
@@ -257,28 +308,39 @@ async function openWebRequest(
 		const secret = server.consumeSecret();
 		if (!params.allowEmpty && secret.length === 0) {
 			request.state = "failed";
-			reserved.delete(envVar);
+			request.terminalAt = Date.now();
+			pruneWebRequests(requests);
+			release();
 			return;
 		}
 		storeSecret(envVar, secret, tracked, redacted);
-		reserved.delete(envVar);
+		release();
 		request.state = "ready";
-		try { ctx.ui.notify(`getpass web request ${request.id} is ready; ${envVar} is available to tools.`, "info"); } catch { /* UI may be gone during shutdown. */ }
-		try { onUpdate?.({ content: [{ type: "text" as const, text: `getpass web request ${request.id} is ready; ${envVar} is available to tools.` }], details: { requestId: request.id, envVar, inputChannel: "web", status: "ready", availableToBash: true } }); } catch { /* Updates are best-effort and never affect capture. */ }
+		request.terminalAt = Date.now();
+		pruneWebRequests(requests);
+		const readyMessage = `getpass web request ${request.id}: ready; invoke getpass_web_consume or getpass_web_status with this request ID.`;
+		try { ctx.ui.notify(readyMessage, "info"); } catch { /* UI may be gone during shutdown. */ }
+		if (!lifecycle.shuttingDown && request.generation === lifecycle.generation && request.state === "ready") {
+			try { pi.sendUserMessage(readyMessage, { deliverAs: "followUp", expandPromptTemplates: false }); } catch { /* Session may have ended. */ }
+		}
 	}).catch((error: unknown) => {
-		reserved.delete(envVar);
-		if (request.state === "pending") request.state = error instanceof WebServerError && error.reason === "expired" ? "expired" : "failed";
+		release();
+		if (request.state === "pending") {
+			request.state = error instanceof WebServerError && error.reason === "expired" ? "expired" : "failed";
+			request.terminalAt = Date.now();
+			pruneWebRequests(requests);
+		}
 	});
 	void request.completion;
 	const message = `getpass web opened. Relay this URL and opaque request ID ${request.id}; the secret is never returned in tool output. URL: ${server.url}`;
 	try { ctx.ui.notify(`getpass web request ${request.id} opened. Submit within ${Number.isFinite(ttl) ? ttl : 90}s.`, "info"); } catch { /* UI is optional for web capture. */ }
-	try { onUpdate?.({ content: [{ type: "text" as const, text: message }], details: { requestId: request.id, envVar, inputChannel: "web", url: server.url, status: "pending" } }); } catch { /* Relay update is best-effort. */ }
 	return { content: [{ type: "text" as const, text: message }], details: { requestId: request.id, envVar, inputChannel: "web", url: server.url, status: "pending", availableToBash: false } };
 }
 
 function requireWebRequest(params: WebRequestParams, requests: Map<string, WebRequest>): WebRequest {
 	const id = params.requestId.trim();
-	if (!/^[a-f0-9]{20,128}$/.test(id)) throw new Error("Invalid getpass web request ID");
+	if (!/^[a-f0-9]{36}$/.test(id)) throw new Error("Invalid getpass web request ID");
+	pruneWebRequests(requests);
 	const request = requests.get(id);
 	if (!request) throw new Error("Unknown getpass web request ID");
 	return request;
