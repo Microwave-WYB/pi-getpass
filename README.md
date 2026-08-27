@@ -7,14 +7,17 @@ A pi package that adds a `getpass` tool for collecting secrets safely from the u
 When the agent needs an API key, token, password, or other secret, it calls `getpass` with an exact env var name like `OPENAI_API_KEY`. The package temporarily replaces the normal pi input UI with a masked secret input, stores the secret in `process.env` for the current pi process, and returns only the env var name to the model. The secret value is not written to chat/session history.
 
 
-## Web mode (non-TUI)
+## getpass web (asynchronous, non-TUI lifecycle)
 
-`getpass` accepts `via: "web"` — instead of the TUI masked prompt, a tailnet
-single-shot page opens (default server: `python3 ~/Projects/pi-supervisor/main/scripts/getpass-web.py`,
-override with `GETPASS_WEB_CMD`, TTL via `GETPASS_TTL`). The URL is notified in the
-TUI and returned in the tool result so the agent can relay it (Telegram relay is
-user-approved). The secret is stored through the same tracked/redacted mechanism
-as the TUI path. Smoke test: `npx tsx tests/smoke-web.ts`.
+`getpass` with `via: "web"` implements the **getpass web** flow. It immediately returns a relayable tailnet URL and opaque request ID before submission. A single-use page accepts the secret; background capture then populates only the requested tracked environment variable and activates redaction. The request has a TTL and can be checked, consumed, or cancelled without returning the secret:
+
+```text
+getpass_web_status   { requestId }
+getpass_web_consume  { requestId }
+getpass_web_cancel   { requestId }
+```
+
+Each request is isolated. Duplicate submissions, expiry, cancellation, and session shutdown close the server and remove temporary 0600 artifacts. The server binds only to Tailscale IPv4 (`100.64.0.0/10`) or Tailscale IPv6 ULA (`fd7a:115c:a1e0::/48`); loopback is accepted only for explicit local tests. Active pending/ready web requests and startup attempts are capped at 256 before server allocation. The ready notification uses Pi's registration-time `sendUserMessage(..., { deliverAs: "followUp", expandPromptTemplates: false })`, so it remains agent-visible after tool settlement; it contains only the opaque request ID, `ready`, and the bounded status/consume instruction. Unconsumed ready metadata remains consumable for 15 minutes and is not silently evicted by pressure; after that, the web acknowledgement/consume window expires, while a captured value remains available in its tracked, redacted environment variable. Uncaptured expiry is unavailable and fully cleaned; other terminal metadata is bounded to 128 requests and 15 minutes. The secret is never printed or included in chat/history, tool output, logs, intercom messages, or command text. Smoke test: `npx tsx tests/smoke-web.ts`.
 
 ## What this is / is not
 
