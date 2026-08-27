@@ -142,6 +142,21 @@ test("public web request IDs are strictly validated before lookup", async () => 
 	await assert.rejects(tools.getpass_web_status.execute("status", { requestId: "a".repeat(36) }), /Unknown getpass web request ID/);
 });
 
+test("server request IDs reject before startup or artifact construction", async () => {
+	const directory = mkdtempSync(join("/tmp", "getpass-web-request-id-"));
+	const oldRuntime = process.env.XDG_RUNTIME_DIR;
+	process.env.XDG_RUNTIME_DIR = directory;
+	try {
+		for (const requestId of ["", "short", "../artifact", "A".repeat(36), "a".repeat(35), "a".repeat(37)]) {
+			await assert.rejects(startSecureWebServer({ host: "127.0.0.1", prompt: "id", ttlMs: 100, requestId }), /strict opaque hex ID/);
+		}
+		assert.deepEqual(readdirSync(directory), []);
+	} finally {
+		if (oldRuntime === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = oldRuntime;
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
 
 test("web bind host accepts only explicit loopback or Tailscale ranges", async () => {
 	for (const host of ["0.0.0.0", "::", "192.168.1.20", "100.63.0.1", "100.128.0.1", "fd00::1"]) {
@@ -151,11 +166,101 @@ test("web bind host accepts only explicit loopback or Tailscale ranges", async (
 	await loopback.close();
 });
 
+test("ready requests survive terminal pressure until consume", async () => {
+	const oldHost = process.env.GETPASS_WEB_HOST;
+	const oldLoopback = process.env.GETPASS_WEB_ALLOW_LOOPBACK;
+	process.env.GETPASS_WEB_HOST = "127.0.0.1";
+	process.env.GETPASS_WEB_ALLOW_LOOPBACK = "1";
+	const opened: Array<{ envVar: string; requestId: string; url: string }> = [];
+	try {
+		const { tools, ctx, handlers } = extension();
+		for (let i = 0; i < 129; i++) {
+			const envVar = `GETPASS_WEB_PRESSURE_${i}`;
+			delete process.env[envVar];
+			const result = await tools.getpass.execute(`pressure-${i}`, { envVar, via: "web" }, undefined, undefined, ctx);
+			opened.push({ envVar, requestId: result.details.requestId, url: result.details.url });
+			assert.equal((await fetch(result.details.url, { method: "POST", body: body(`pressure-value-${i}`) })).status, 200);
+			await nextTurn();
+		}
+		assert.equal((await tools.getpass_web_status.execute("first-status", { requestId: opened[0]!.requestId })).details.status, "ready");
+		assert.equal((await tools.getpass_web_consume.execute("first-consume", { requestId: opened[0]!.requestId })).details.status, "consumed");
+		for (const request of opened.slice(1)) {
+			assert.equal((await tools.getpass_web_consume.execute("cleanup", { requestId: request.requestId })).details.status, "consumed");
+		}
+		await handlers.get("session_shutdown")!();
+	} finally {
+		for (const request of opened) delete process.env[request.envVar];
+		if (oldHost === undefined) delete process.env.GETPASS_WEB_HOST; else process.env.GETPASS_WEB_HOST = oldHost;
+		if (oldLoopback === undefined) delete process.env.GETPASS_WEB_ALLOW_LOOPBACK; else process.env.GETPASS_WEB_ALLOW_LOOPBACK = oldLoopback;
+	}
+	assert.equal(process.env.GETPASS_WEB_PRESSURE_0, undefined);
+});
+
+test("ready expiry transitions to expired while preserving tracked redaction state", async () => {
+	const oldHost = process.env.GETPASS_WEB_HOST;
+	const oldLoopback = process.env.GETPASS_WEB_ALLOW_LOOPBACK;
+	const oldNow = Date.now;
+	process.env.GETPASS_WEB_HOST = "127.0.0.1";
+	process.env.GETPASS_WEB_ALLOW_LOOPBACK = "1";
+	delete process.env.GETPASS_WEB_EXPIRY;
+	try {
+		const { tools, ctx, handlers } = extension();
+		const opened = await tools.getpass.execute("expiry-ready", { envVar: "GETPASS_WEB_EXPIRY", via: "web" }, undefined, undefined, ctx);
+		assert.equal((await fetch(opened.details.url, { method: "POST", body: body("expiry-value") })).status, 200);
+		await nextTurn();
+		const capturedAt = oldNow();
+		Date.now = () => capturedAt + 15 * 60 * 1000 + 1;
+		const expired = await tools.getpass_web_status.execute("expiry-status", { requestId: opened.details.requestId });
+		assert.equal(expired.details.status, "expired");
+		assert.equal(process.env.GETPASS_WEB_EXPIRY, "expiry-value");
+		await handlers.get("session_shutdown")!();
+	} finally {
+		Date.now = oldNow;
+		delete process.env.GETPASS_WEB_EXPIRY;
+		if (oldHost === undefined) delete process.env.GETPASS_WEB_HOST; else process.env.GETPASS_WEB_HOST = oldHost;
+		if (oldLoopback === undefined) delete process.env.GETPASS_WEB_ALLOW_LOOPBACK; else process.env.GETPASS_WEB_ALLOW_LOOPBACK = oldLoopback;
+	}
+	assert.equal(process.env.GETPASS_WEB_EXPIRY, undefined);
+});
+
+
+test("post-listen server errors atomically close, reject, unlink, and stop serving", async () => {
+	const directory = mkdtempSync(join("/tmp", "getpass-web-server-error-"));
+	const oldRuntime = process.env.XDG_RUNTIME_DIR;
+	process.env.XDG_RUNTIME_DIR = directory;
+	let pendingRaw: http.Server | undefined;
+	let pending: Awaited<ReturnType<typeof startSecureWebServer>> | undefined;
+	let submitted: Awaited<ReturnType<typeof startSecureWebServer>> | undefined;
+	try {
+		pending = await startSecureWebServer({ host: "127.0.0.1", prompt: "error", ttlMs: 10_000, onListeningForTest: (raw) => { pendingRaw = raw; } });
+		pendingRaw!.emit("error", new Error("injected post-listen error"));
+		await assert.rejects(pending.waitForSubmission(), (error: unknown) => error instanceof WebServerError && error.reason === "failed");
+		assert.equal(pending.state, "closed");
+		await pending.close();
+		await assert.rejects(fetch(pending.url));
+
+		let submittedRaw: http.Server | undefined;
+		submitted = await startSecureWebServer({ host: "127.0.0.1", prompt: "error", ttlMs: 10_000, onListeningForTest: (raw) => { submittedRaw = raw; } });
+		assert.equal((await fetch(submitted.url, { method: "POST", body: body("server-error-disposable") })).status, 200);
+		submittedRaw!.emit("error", new Error("injected post-listen error after artifact"));
+		await submitted.close();
+		assert.equal(submitted.state, "closed");
+		assert.deepEqual(readdirSync(directory), []);
+		await assert.rejects(fetch(submitted.url));
+	} finally {
+		if (pending) await pending.close();
+		if (submitted) await submitted.close();
+		if (oldRuntime === undefined) delete process.env.XDG_RUNTIME_DIR; else process.env.XDG_RUNTIME_DIR = oldRuntime;
+		rmSync(directory, { recursive: true, force: true });
+	}
+
+
+});
 test("artifact fault injection unlinks a partially created 0600 artifact", async () => {
 	const directory = mkdtempSync(join("/tmp", "getpass-web-fault-"));
 	const oldRuntime = process.env.XDG_RUNTIME_DIR;
 	process.env.XDG_RUNTIME_DIR = directory;
-	const server = await startSecureWebServer({ host: "127.0.0.1", prompt: "fault", ttlMs: 10_000, artifactFailure: "after-write", requestId: "fault-request-000000000000" });
+	const server = await startSecureWebServer({ host: "127.0.0.1", prompt: "fault", ttlMs: 10_000, artifactFailure: "after-write", requestId: "f".repeat(36) });
 	try {
 		const response = await fetch(server.url, { method: "POST", body: body("fault-disposable") });
 		assert.equal(response.status, 500);

@@ -12,6 +12,7 @@ import { startSecureWebServer, type SecureWebServer, WebServerError } from "./ge
 
 const MAX_TERMINAL_WEB_REQUESTS = 128;
 const TERMINAL_WEB_RETENTION_MS = 15 * 60 * 1000;
+const READY_WEB_RETENTION_MS = 15 * 60 * 1000;
 const envNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const getpassSchema = Type.Object({
 	envVar: Type.String({ description: "Exact temporary environment variable name to populate, for example OPENAI_API_KEY or GITHUB_TOKEN." }),
@@ -35,6 +36,7 @@ type WebRequest = {
 	reservation: symbol;
 	generation: symbol;
 	terminalAt?: number;
+	readyTimer?: NodeJS.Timeout;
 	server: SecureWebServer;
 	state: WebState;
 	completion: Promise<void>;
@@ -112,6 +114,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params) {
 			const request = requireWebRequest(params, webRequests);
 			if (request.state === "ready") {
+				if (request.readyTimer) clearTimeout(request.readyTimer);
 				request.state = "consumed";
 				request.terminalAt = Date.now();
 				pruneWebRequests(webRequests);
@@ -188,6 +191,7 @@ export default function (pi: ExtensionAPI) {
 	eventApi.on("session_shutdown", async () => {
 		lifecycle.shuttingDown = true;
 		await Promise.all([...webRequests.values()].map(async (request) => {
+			if (request.readyTimer) { clearTimeout(request.readyTimer); request.readyTimer = undefined; }
 			if (request.state === "pending") {
 				request.state = "cancelled";
 				request.terminalAt = Date.now();
@@ -212,13 +216,24 @@ function releaseReservation(reserved: Map<string, symbol>, envVar: string, owner
 	if (reserved.get(envVar) === owner) reserved.delete(envVar);
 }
 
+function expireReadyRequest(request: WebRequest): void {
+	if (request.state !== "ready") return;
+	request.state = "expired";
+	request.terminalAt = Date.now();
+	request.readyTimer = undefined;
+	void request.server.cancel();
+}
+
 function pruneWebRequests(requests: Map<string, WebRequest>): void {
 	const now = Date.now();
-	const terminal = [...requests.values()].filter((request) => request.state !== "pending" && request.terminalAt !== undefined);
-	for (const request of terminal) {
-		if (now - (request.terminalAt ?? now) > TERMINAL_WEB_RETENTION_MS) requests.delete(request.id);
+	for (const request of requests.values()) {
+		if (request.state === "ready" && request.terminalAt !== undefined && now - request.terminalAt > READY_WEB_RETENTION_MS) expireReadyRequest(request);
 	}
-	const retained = [...requests.values()].filter((request) => request.state !== "pending" && request.terminalAt !== undefined).sort((a, b) => (a.terminalAt ?? 0) - (b.terminalAt ?? 0));
+	// A ready request remains consumable until its explicit 15-minute expiry; only other terminal states are pressure-evictable.
+	for (const request of requests.values()) {
+		if (request.state !== "pending" && request.state !== "ready" && request.terminalAt !== undefined && now - request.terminalAt > TERMINAL_WEB_RETENTION_MS) requests.delete(request.id);
+	}
+	const retained = [...requests.values()].filter((request) => request.state !== "pending" && request.state !== "ready" && request.terminalAt !== undefined).sort((a, b) => (a.terminalAt ?? 0) - (b.terminalAt ?? 0));
 	for (const request of retained.slice(0, Math.max(0, retained.length - MAX_TERMINAL_WEB_REQUESTS))) requests.delete(request.id);
 }
 
@@ -318,6 +333,11 @@ async function openWebRequest(
 		request.state = "ready";
 		request.terminalAt = Date.now();
 		pruneWebRequests(requests);
+		request.readyTimer = setTimeout(() => {
+			expireReadyRequest(request);
+			pruneWebRequests(requests);
+		}, READY_WEB_RETENTION_MS);
+		request.readyTimer.unref?.();
 		const readyMessage = `getpass web request ${request.id}: ready; invoke getpass_web_consume or getpass_web_status with this request ID.`;
 		try { ctx.ui.notify(readyMessage, "info"); } catch { /* UI may be gone during shutdown. */ }
 		if (!lifecycle.shuttingDown && request.generation === lifecycle.generation && request.state === "ready") {

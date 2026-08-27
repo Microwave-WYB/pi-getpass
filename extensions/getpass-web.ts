@@ -34,6 +34,8 @@ export interface SecureWebServerOptions {
 	postTimeoutMs?: number;
 	/** Test-only fault injection; never carries secret data. */
 	artifactFailure?: "after-write" | "after-chmod";
+	/** Test-only hook for deterministic post-listen server-error coverage. */
+	onListeningForTest?: (server: http.Server) => void;
 }
 
 export interface SecureWebSubmission {
@@ -128,9 +130,11 @@ function unlinkQuietly(file: string | undefined): void {
 }
 
 export async function startSecureWebServer(options: SecureWebServerOptions): Promise<SecureWebServer> {
+	const requestedRequestId = options.requestId;
+	const requestId = requestedRequestId ?? crypto.randomBytes(18).toString("hex");
+	if (!/^[a-f0-9]{36}$/.test(requestId)) throw new WebServerError("failed", "getpass web request ID is not a strict opaque hex ID");
 	const requestedHost = options.host?.trim();
 	const host = requestedHost ? validateBindHost(requestedHost, true) : configuredHost();
-	const requestId = options.requestId ?? crypto.randomBytes(18).toString("hex");
 	const token = crypto.randomBytes(24).toString("hex");
 	const ttlMs = Math.max(1, options.ttlMs);
 	const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1000));
@@ -141,6 +145,7 @@ export async function startSecureWebServer(options: SecureWebServerOptions): Pro
 	let submissionSettled = false;
 	let closePromise: Promise<void> | undefined;
 	let timer: NodeJS.Timeout | undefined;
+	let serverFailureHandled = false;
 
 	const submission = new Promise<SecureWebSubmission>((resolve, reject) => {
 		resolveSubmission = resolve;
@@ -150,7 +155,7 @@ export async function startSecureWebServer(options: SecureWebServerOptions): Pro
 	// handler also prevents an unhandled rejection during host shutdown.
 	submission.catch(() => undefined);
 
-	let closeServer: (force?: boolean) => Promise<void>;
+	let closeServer: (force?: boolean) => Promise<void> = async () => {};
 	const server = http.createServer((req, res) => {
 		const requestUrl = req.url ?? "/";
 		if (req.method === "GET") {
@@ -212,14 +217,26 @@ export async function startSecureWebServer(options: SecureWebServerOptions): Pro
 		socket.once("close", () => sockets.delete(socket));
 	});
 	server.on("error", () => {
+		if (serverFailureHandled) return;
+		serverFailureHandled = true;
+		currentState = "closed";
+		unlinkQuietly(artifactPath);
+		artifactPath = undefined;
 		if (!submissionSettled) {
 			submissionSettled = true;
 			rejectSubmission(new WebServerError("failed"));
 		}
+		void closeServer(true).catch(() => undefined);
 	});
 
 	closeServer = (force = true): Promise<void> => {
-		if (closePromise) return closePromise;
+		if (closePromise) {
+			if (force) {
+				for (const socket of sockets) socket.destroy();
+				(server as http.Server & { closeAllConnections?: () => void }).closeAllConnections?.();
+			}
+			return closePromise;
+		}
 		if (timer) clearTimeout(timer);
 		closePromise = new Promise((resolve) => {
 			let finished = false;
@@ -265,6 +282,7 @@ export async function startSecureWebServer(options: SecureWebServerOptions): Pro
 		unlinkQuietly(artifactPath);
 		void closeServer();
 	}, ttlMs);
+	if (options.onListeningForTest) options.onListeningForTest(server);
 
 	const port = (server.address() as { port: number }).port;
 	const displayHost = host.includes(":") ? `[${host}]` : host;
